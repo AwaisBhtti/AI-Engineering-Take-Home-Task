@@ -65,9 +65,10 @@ ROTATE_MAP = {
 
 CPU_COUNT = os.cpu_count() or 1
 
-# Set once in main() based on device: True enables FP16 (Tensor Core) inference
-# on CUDA. Left False on CPU, where half precision isn't supported/faster.
-HALF = False
+# Set once in main() based on device: 16 enables FP16 (Tensor Core) inference
+# on CUDA via Ultralytics' 'quantize' argument (the 'half=True' flag is
+# deprecated). Left None on CPU, where FP16 isn't supported/faster.
+QUANTIZE = None
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +291,7 @@ def run_inference(model: YOLO, frames: list) -> list:
         conf=CONF,
         iou=IOU,
         classes=TARGET_INDICES_LIST,
-        half=HALF,
+        quantize=QUANTIZE,
         verbose=False,
         stream=False,
     )
@@ -482,16 +483,16 @@ def main() -> None:
     model.to(device)
 
     # FP16 (Tensor Core) inference — only on CUDA, not supported/faster on CPU.
-    global HALF
-    HALF = (device == "cuda")
+    global QUANTIZE
+    QUANTIZE = 16 if device == "cuda" else None
 
-    # Warm up model with a dummy frame (same half setting used at inference time)
+    # Warm up model with a dummy frame (same quantize setting used at inference time)
     _warmup(model, device)
 
     # Determine GPU inference batch size based on available device VRAM
     gpu_batch_size = _pick_batch_size(device)
     print(f"Device: {device}  |  YOLO inference batch size: {gpu_batch_size}  |  "
-          f"FP16: {HALF}  |  Subsample: {SAMPLE_FPS} fps/sec")
+          f"quantize: {QUANTIZE}  |  Subsample: {SAMPLE_FPS} fps/sec")
 
     # Open output file with line buffering
     with open(output_path, "w", buffering=1) as out_file:
@@ -545,7 +546,7 @@ def _cuda_available() -> bool:
 
 def _warmup(model: YOLO, device: str) -> None:
     dummy = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
-    model([dummy], imgsz=IMGSZ, conf=CONF, classes=TARGET_INDICES_LIST, half=HALF, verbose=False)
+    model([dummy], imgsz=IMGSZ, conf=CONF, classes=TARGET_INDICES_LIST, quantize=QUANTIZE, verbose=False)
 
 
 def _pick_batch_size(device: str) -> int:

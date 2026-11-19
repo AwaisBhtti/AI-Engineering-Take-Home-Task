@@ -38,6 +38,11 @@ IMGSZ        = 640
 CONF         = 0.4
 IOU          = 0.7   # Ultralytics default class-aware NMS threshold
 
+# Frame subsampling: at most this many frames are sent to YOLO per second of
+# video. Set to a number >= native fps (e.g. 999) to disable and run every
+# frame. This is the ONLY thing you need to change to tune speed vs. accuracy.
+SAMPLE_FPS   = 15
+
 # Exact class names as specified in the brief (section 1 and section 4)
 TARGET_CLASSES = {"person", "car", "dog", "laptop", "cell phone"}
 
@@ -59,6 +64,10 @@ ROTATE_MAP = {
 }
 
 CPU_COUNT = os.cpu_count() or 1
+
+# Set once in main() based on device: True enables FP16 (Tensor Core) inference
+# on CUDA. Left False on CPU, where half precision isn't supported/faster.
+HALF = False
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +119,9 @@ def decode_frames(video_bytes: bytes):
     """
     Decode all frames from a video stored as raw bytes in a single pass.
 
-    Yields (second_index: int, frame_bgr: np.ndarray) for every frame.
+    Yields (second_index: int, frac_within_second: float, frame_bgr: np.ndarray)
+    for every frame. frac_within_second is only used for subsampling and never
+    affects which second a frame is assigned to.
     - Uses exact Fraction arithmetic on integer PTS differences to prevent float drift.
     - Clamps non-monotonic PTS jumps.
     - Demuxes with per-packet AVError recovery so single corrupt packets don't abort playable video.
@@ -183,11 +194,15 @@ def decode_frames(video_bytes: bytes):
             last_second = second
             frame_count += 1
 
+            # Fractional position within the second (0.0-1.0), used only to
+            # pick evenly-spaced samples — does not affect second boundaries.
+            frac = float(rel) - second
+
             img = frame.to_ndarray(format="bgr24")
             if rotate_code is not None:
                 img = cv2.rotate(img, rotate_code)
 
-            return second, img
+            return second, frac, img
 
         # Demux packets with per-packet AVError recovery.
         # Note: Do not skip packet.size == 0; PyAV's empty EOF packet triggers internal B-frame flushing.
@@ -275,6 +290,7 @@ def run_inference(model: YOLO, frames: list) -> list:
         conf=CONF,
         iou=IOU,
         classes=TARGET_INDICES_LIST,
+        half=HALF,
         verbose=False,
         stream=False,
     )
@@ -334,6 +350,15 @@ def process_video(
     frame_buffer:  list = []   # [(bgr_array), ...]
     second_buffer: list = []   # parallel second indices
 
+    # --- Frame subsampling state (SAMPLE_FPS is the only knob to tune) -------
+    # Each second is divided into SAMPLE_FPS equal time-slots; we keep only
+    # the first frame seen in each slot, so at most SAMPLE_FPS frames per
+    # second reach the model. last_seen_second above still tracks every
+    # decoded frame, so output coverage (which seconds get written) is
+    # unaffected by subsampling.
+    sample_second = -1
+    sample_slot   = -1
+
     def _flush_buffer() -> None:
         if frame_buffer:
             detections = run_inference(model, frame_buffer)
@@ -350,8 +375,18 @@ def process_video(
             next_second_to_write += 1
 
     try:
-        for second, frame in decode_frames(video_bytes):
+        for second, frac, frame in decode_frames(video_bytes):
             last_seen_second = max(last_seen_second, second)
+
+            # Subsample: keep at most SAMPLE_FPS frames per second.
+            if second != sample_second:
+                sample_second = second
+                sample_slot = -1
+            slot = int(frac * SAMPLE_FPS)
+            if slot == sample_slot:
+                continue  # already kept a sample for this time-slot
+            sample_slot = slot
+
             frame_buffer.append(frame)
             second_buffer.append(second)
 
@@ -445,12 +480,18 @@ def main() -> None:
 
     model = YOLO(MODEL_PATH)
     model.to(device)
-    # Warm up model with a dummy frame
+
+    # FP16 (Tensor Core) inference — only on CUDA, not supported/faster on CPU.
+    global HALF
+    HALF = (device == "cuda")
+
+    # Warm up model with a dummy frame (same half setting used at inference time)
     _warmup(model, device)
 
     # Determine GPU inference batch size based on available device VRAM
     gpu_batch_size = _pick_batch_size(device)
-    print(f"Device: {device}  |  YOLO inference batch size: {gpu_batch_size}")
+    print(f"Device: {device}  |  YOLO inference batch size: {gpu_batch_size}  |  "
+          f"FP16: {HALF}  |  Subsample: {SAMPLE_FPS} fps/sec")
 
     # Open output file with line buffering
     with open(output_path, "w", buffering=1) as out_file:
@@ -504,7 +545,7 @@ def _cuda_available() -> bool:
 
 def _warmup(model: YOLO, device: str) -> None:
     dummy = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
-    model([dummy], imgsz=IMGSZ, conf=CONF, classes=TARGET_INDICES_LIST, verbose=False)
+    model([dummy], imgsz=IMGSZ, conf=CONF, classes=TARGET_INDICES_LIST, half=HALF, verbose=False)
 
 
 def _pick_batch_size(device: str) -> int:

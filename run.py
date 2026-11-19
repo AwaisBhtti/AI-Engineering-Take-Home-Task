@@ -41,7 +41,7 @@ IOU          = 0.7   # Ultralytics default class-aware NMS threshold
 # Frame subsampling: at most this many frames are sent to YOLO per second of
 # video. Set to a number >= native fps (e.g. 999) to disable and run every
 # frame. This is the ONLY thing you need to change to tune speed vs. accuracy.
-SAMPLE_FPS   = 15
+SAMPLE_FPS   = 10
 
 # Exact class names as specified in the brief (section 1 and section 4)
 TARGET_CLASSES = {"person", "car", "dog", "laptop", "cell phone"}

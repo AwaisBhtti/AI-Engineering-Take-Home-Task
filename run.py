@@ -135,9 +135,18 @@ def decode_frames(video_bytes: bytes):
         first_pts = None
         first_time = None
         last_second = 0
+        frame_count = 0
+
+        # Precompute stream duration in seconds if available
+        stream_duration_sec = None
+        if stream.duration is not None and stream.time_base is not None:
+            try:
+                stream_duration_sec = float(stream.duration * stream.time_base)
+            except Exception:
+                pass
 
         def _process_frame(frame):
-            nonlocal rotate_code, rotation_determined, first_pts, first_time, last_second
+            nonlocal rotate_code, rotation_determined, first_pts, first_time, last_second, frame_count
 
             if not rotation_determined:
                 rotate_code = _get_rotation_code(stream, frame)
@@ -158,10 +167,21 @@ def decode_frames(video_bytes: bytes):
             else:
                 return None
 
+            # Guard against garbage / corrupted PTS forward jumps:
+            # 1. A single step jumping forward by > 60s (normal frame intervals are ~0.033s)
+            if frame_count > 0 and (second - last_second) > 60:
+                return None
+
+            # 2. Timestamps far beyond declared stream duration
+            if stream_duration_sec is not None and second > (stream_duration_sec + 30):
+                return None
+
             # Non-monotonic PTS guard: prevent backward jumps
             if second < last_second:
                 second = last_second
+
             last_second = second
+            frame_count += 1
 
             img = frame.to_ndarray(format="bgr24")
             if rotate_code is not None:
@@ -169,10 +189,9 @@ def decode_frames(video_bytes: bytes):
 
             return second, img
 
-        # 1. Demux packets with per-packet AVError recovery
+        # Demux packets with per-packet AVError recovery.
+        # Note: Do not skip packet.size == 0; PyAV's empty EOF packet triggers internal B-frame flushing.
         for packet in container.demux(stream):
-            if packet.size == 0:
-                continue
             try:
                 for frame in packet.decode():
                     res = _process_frame(frame)
@@ -180,15 +199,6 @@ def decode_frames(video_bytes: bytes):
                         yield res
             except av.AVError:
                 continue
-
-        # 2. Flush remaining buffered frames from codec context
-        try:
-            for frame in stream.decode(None):
-                res = _process_frame(frame)
-                if res is not None:
-                    yield res
-        except Exception:
-            pass
 
     finally:
         container.close()

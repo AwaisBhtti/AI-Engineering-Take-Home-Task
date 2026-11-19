@@ -1,51 +1,24 @@
 # =============================================================================
 # AI Engineering Take-Home — requirements.txt
-# Target machine: Ubuntu 22.04, Python 3.11, CUDA 12, NVIDIA RTX 4090
+# Evaluation: Ubuntu 22.04, Python 3.11, CUDA 12, RTX 4090, offline sandbox
 #
-# IMPORTANT: After installing on Colab, run:
-#   pip freeze > requirements.txt
-# and commit the pinned output. The graders need exact versions.
+# IMPORTANT: These are placeholder versions. Before final submission, run this
+# single command on Colab to get YOUR exact installed versions:
 #
-# Prep step (internet allowed, not timed):
-#   python -c "from ultralytics import YOLO; YOLO('yolo11l.pt')"
-# This pre-downloads yolo11l.pt so run.py works fully offline.
+#   pip list --format=freeze | grep -iE "^(ultralytics|torch|torchvision|pyarrow|av|opencv-python|numpy)=="
+#
+# Then replace the versions below with the output.
+# Do NOT run `pip freeze > requirements.txt` — Colab has 400+ preinstalled
+# packages that will bloat or break install on the grading VM.
 # =============================================================================
 
-# --- PyTorch (CUDA 12.1 build — compatible with any CUDA 12.x driver) --------
-# Must come from the PyTorch wheel index, not the default PyPI index.
---extra-index-url https://download.pytorch.org/whl/cu121
-torch>=2.1.0
-torchvision>=0.16.0
+# Core inference
+torch==2.6.0
+torchvision==0.21.0
+ultralytics==8.3.145
+numpy==1.26.4
 
-# --- YOLO model framework ----------------------------------------------------
-ultralytics>=8.0.0
-
-# --- Parquet reading ---------------------------------------------------------
-# PyArrow reads .parquet files with iter_batches() for streaming (no RAM spike)
-pyarrow>=14.0.0
-
-# --- Video decoding ----------------------------------------------------------
-# PyAV wraps FFmpeg; handles timestamps, rotation side-data, and NVDEC codecs
-# (h264_cuvid / hevc_cuvid) with silent CPU fallback when NVDEC unavailable.
-av>=12.0.0
-
-# --- Image processing --------------------------------------------------------
-# opencv-python-headless: no GUI, no X11 dependency — safe inside a VM/sandbox
-opencv-python-headless>=4.8.0
-Pillow>=10.0.0
-
-# --- Core scientific ---------------------------------------------------------
-numpy>=1.24.0
-scipy>=1.10.0          # used for median / statistics by ultralytics internals
-
-# --- Ultralytics runtime dependencies ----------------------------------------
-# These are transitive deps of ultralytics, but listed explicitly so pip can
-# resolve and cache them all during the internet-allowed install step.
-pandas>=2.0.0
-PyYAML>=6.0
-tqdm>=4.64.0
-psutil>=5.9.0          # used for os.cpu_count() / memory checks
-py-cpuinfo>=9.0.0      # ultralytics hardware reporting
-matplotlib>=3.7.0
-seaborn>=0.12.0
-
+# Data & video decoding
+pyarrow==17.0.0
+av==13.1.0
+opencv-python==4.10.0.84

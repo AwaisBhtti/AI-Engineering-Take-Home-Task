@@ -111,10 +111,11 @@ def decode_frames(video_bytes: bytes):
     Decode all frames from a video stored as raw bytes in a single pass.
 
     Yields (second_index: int, frame_bgr: np.ndarray) for every frame.
-    - second_index = floor(frame_timestamp_in_seconds), counting from the
-      timestamp of the very first decoded frame.
-    - frame_bgr is in BGR colour order as required by the brief.
-    - Rotation (if present) is applied before yielding.
+    - Uses exact Fraction arithmetic on integer PTS differences to prevent float drift.
+    - Clamps non-monotonic PTS jumps.
+    - Demuxes with per-packet AVError recovery so single corrupt packets don't abort playable video.
+    - Flushes remaining frames from the decoder at EOF.
+    - Rotation is determined on the first decoded frame and applied to all frames.
     """
     container = av.open(io.BytesIO(video_bytes))
     try:
@@ -131,35 +132,63 @@ def decode_frames(video_bytes: bytes):
 
         rotate_code = None
         rotation_determined = False
-        first_ts = None
+        first_pts = None
+        first_time = None
+        last_second = 0
 
-        for frame in container.decode(stream):
+        def _process_frame(frame):
+            nonlocal rotate_code, rotation_determined, first_pts, first_time, last_second
+
             if not rotation_determined:
                 rotate_code = _get_rotation_code(stream, frame)
                 rotation_determined = True
 
             if frame.pts is not None:
-                ts = float(frame.pts * stream.time_base)
+                if first_pts is None:
+                    first_pts = frame.pts
+                # Exact Fraction arithmetic: prevents floating-point drift across boundaries
+                rel = (frame.pts - first_pts) * stream.time_base
+                second = math.floor(rel) if rel > 0 else 0
             elif getattr(frame, "time", None) is not None:
-                ts = float(frame.time)
+                t = float(frame.time)
+                if first_time is None:
+                    first_time = t
+                rel = t - first_time
+                second = math.floor(rel) if rel > 0 else 0
             else:
-                continue
+                return None
 
-            # Normalise: timestamp relative to first decoded frame
-            if first_ts is None:
-                first_ts = ts
-            ts -= first_ts
+            # Non-monotonic PTS guard: prevent backward jumps
+            if second < last_second:
+                second = last_second
+            last_second = second
 
-            if ts < 0:
-                ts = 0.0
-
-            second = math.floor(ts)
-            img    = frame.to_ndarray(format="bgr24")
-
+            img = frame.to_ndarray(format="bgr24")
             if rotate_code is not None:
                 img = cv2.rotate(img, rotate_code)
 
-            yield second, img
+            return second, img
+
+        # 1. Demux packets with per-packet AVError recovery
+        for packet in container.demux(stream):
+            if packet.size == 0:
+                continue
+            try:
+                for frame in packet.decode():
+                    res = _process_frame(frame)
+                    if res is not None:
+                        yield res
+            except av.AVError:
+                continue
+
+        # 2. Flush remaining buffered frames from codec context
+        try:
+            for frame in stream.decode(None):
+                res = _process_frame(frame)
+                if res is not None:
+                    yield res
+        except Exception:
+            pass
 
     finally:
         container.close()
@@ -342,12 +371,13 @@ def process_video(
         except Exception:
             pass
 
-        # 2. Emit whatever complete seconds we have
+        # 2. Emit all completed seconds strictly before last_seen_second
+        # (Preserves completed seconds, fills gaps with empty seconds, and avoids partial crash second)
         try:
-            while second_buckets and next_second_to_write <= last_seen_second:
-                if next_second_to_write in second_buckets:
+            if last_seen_second > 0:
+                while next_second_to_write < last_seen_second:
                     _write_second(next_second_to_write)
-                next_second_to_write += 1
+                    next_second_to_write += 1
         except Exception:
             pass
 

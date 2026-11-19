@@ -80,70 +80,28 @@ IO_WORKERS = max(1, CPU_COUNT - 1)
 # Video decoding helpers
 # ---------------------------------------------------------------------------
 
-def _get_rotation(stream) -> int:
+def _get_rotation(stream, container=None) -> int:
     """
-    Read rotation degrees (clockwise) from the MP4 container metadata.
+    Read rotation degrees (clockwise) from MP4 metadata.
 
-    The rotation tag is embedded inside the video file itself — in the moov
-    box / track header transformation matrix — NOT in the Parquet json column.
-    PyAV exposes it via two paths:
-      1. stream.metadata["rotate"] — integer string, used by older encoders
-      2. stream.side_data DISPLAYMATRIX — transformation matrix, used by newer
-         encoders (e.g. most smartphones)
+    The rotation tag is embedded inside the container/stream metadata
+    (e.g., 'rotate': '90'). We check both stream and container metadata.
     """
-    # Method 1: simple metadata tag
-    rotate_tag = stream.metadata.get("rotate")
-    if rotate_tag:
-        try:
-            return int(rotate_tag) % 360
-        except ValueError:
-            pass
+    sources = []
+    if hasattr(stream, "metadata") and stream.metadata:
+        sources.append(stream.metadata)
+    if container is not None and hasattr(container, "metadata") and container.metadata:
+        sources.append(container.metadata)
 
-    # Method 2: display matrix side data
-    for sd in stream.side_data:
-        if sd.type == "DISPLAYMATRIX":
-            try:
-                # av.video.transform.display_matrix_rotation returns degrees
-                # counter-clockwise, so negate it for clockwise convention.
-                deg = -round(av.video.transform.display_matrix_rotation(sd))
-                return deg % 360
-            except Exception:
-                pass
-
+    for meta in sources:
+        for key in ("rotate", "ROTATION", "rotation"):
+            val = meta.get(key)
+            if val is not None:
+                try:
+                    return int(val) % 360
+                except (ValueError, TypeError):
+                    pass
     return 0
-
-
-def _open_container(video_bytes: bytes) -> av.container.InputContainer:
-    """
-    Open a video container, trying NVDEC hardware decode first.
-
-    NVDEC runs on a dedicated fixed-function chip on the GPU and does NOT
-    compete with YOLO for CUDA cores. If NVDEC is not available (e.g. the
-    system FFmpeg was not compiled with NVDEC support), falls back to CPU
-    decode transparently.
-    """
-    # Probe codec without opening a full decode session
-    probe_buf = io.BytesIO(video_bytes)
-    try:
-        probe = av.open(probe_buf)
-        codec_name = probe.streams.video[0].codec_context.name
-        probe.close()
-    except Exception:
-        # Unreadable container — let the caller handle it
-        return av.open(io.BytesIO(video_bytes))
-
-    hw_codec = NVDEC_MAP.get(codec_name)
-    if hw_codec:
-        try:
-            container = av.open(io.BytesIO(video_bytes),
-                                options={"c:v": hw_codec})
-            # Force codec initialisation to catch NVDEC errors early
-            _ = container.streams.video[0].codec_context.name
-            return container
-        except (av.AVError, Exception):
-            pass  # NVDEC unavailable — fall through to CPU
-
-    return av.open(io.BytesIO(video_bytes))
 
 
 def decode_frames(video_bytes: bytes):
@@ -152,51 +110,52 @@ def decode_frames(video_bytes: bytes):
 
     Yields (second_index: int, frame_bgr: np.ndarray) for every frame.
     - second_index = floor(frame_timestamp_in_seconds), counting from the
-      timestamp of the very first decoded frame (which may not be 0.0 for
-      some containers — we normalise it).
-    - frame_bgr is in BGR colour order as required by the brief and expected
-      by Ultralytics YOLO (which uses cv2 conventions internally).
-    - Rotation (from the MP4 container moov box) is applied before yielding.
+      timestamp of the very first decoded frame.
+    - frame_bgr is in BGR colour order as required by the brief.
+    - Rotation (if present in metadata) is applied before yielding.
     """
-    container = _open_container(video_bytes)
+    container = av.open(io.BytesIO(video_bytes))
     try:
         video_streams = container.streams.video
         if not video_streams:
             raise ValueError("No video stream found")
 
-        stream   = video_streams[0]
-        rotation = _get_rotation(stream)
+        stream = video_streams[0]
+        # Enable multi-threaded FFmpeg CPU frame decoding across available cores
+        try:
+            stream.thread_type = "AUTO"
+        except Exception:
+            pass
+
+        rotation = _get_rotation(stream, container)
         rotate_code = ROTATE_MAP.get(rotation)
 
-        first_ts = None  # will be set on first frame
+        first_ts = None
 
-        for packet in container.demux(stream):
-            try:
-                for frame in packet.decode():
-                    if frame.pts is None:
-                        continue
-
-                    ts = float(frame.pts * stream.time_base)
-
-                    # Normalise: timestamp relative to first decoded frame
-                    if first_ts is None:
-                        first_ts = ts
-                    ts -= first_ts
-
-                    if ts < 0:
-                        ts = 0.0
-
-                    second = math.floor(ts)
-                    img    = frame.to_ndarray(format="bgr24")
-
-                    if rotate_code is not None:
-                        img = cv2.rotate(img, rotate_code)
-
-                    yield second, img
-
-            except av.AVError:
-                # Skip corrupt packets; continue with the rest of the video
+        for frame in container.decode(stream):
+            if frame.pts is not None:
+                ts = float(frame.pts * stream.time_base)
+            elif getattr(frame, "time", None) is not None:
+                ts = float(frame.time)
+            else:
                 continue
+
+            # Normalise: timestamp relative to first decoded frame
+            if first_ts is None:
+                first_ts = ts
+            ts -= first_ts
+
+            if ts < 0:
+                ts = 0.0
+
+            second = math.floor(ts)
+            img    = frame.to_ndarray(format="bgr24")
+
+            if rotate_code is not None:
+                img = cv2.rotate(img, rotate_code)
+
+            yield second, img
+
     finally:
         container.close()
 
@@ -338,8 +297,7 @@ def process_video(
       1. Buffer frames into GPU inference batches of `batch_size`.
       2. Run YOLO on the full batch at once for throughput.
       3. Accumulate per-frame detection dicts into per-second buckets.
-      4. When the second index changes (or at end of video), aggregate and
-         write one JSONL line per completed second.
+      4. Write one JSONL line per completed second.
 
     On any exception mid-video:
       - Lines already written for completed seconds are kept.
@@ -348,6 +306,11 @@ def process_video(
     The brief requires writing a line for every second up to and INCLUDING
     the second that holds the last frame, even if that second is partial.
     """
+    if not video_bytes:
+        out_file.write(json.dumps({"video": video_id, "error": "empty or missing video bytes"}) + "\n")
+        out_file.flush()
+        return
+
     # Accumulator: second_index -> list of per-frame detection dicts
     second_buckets: dict = {}   # {second: [frame_dict, ...]}
     written_seconds: set = set()
@@ -355,6 +318,8 @@ def process_video(
 
     def _write_second(sec: int) -> None:
         """Aggregate and write one JSONL line for `sec`."""
+        if sec in written_seconds:
+            return
         frame_dets = second_buckets.pop(sec, [])
         objects, people = aggregate_second(frame_dets)
         line = {
@@ -366,49 +331,58 @@ def process_video(
         out_file.write(json.dumps(line) + "\n")
         written_seconds.add(sec)
 
-    try:
-        # --- Collect all frames, batch them for YOLO ---
-        # We buffer (second, frame) pairs and flush complete seconds as we go.
-        frame_buffer:  list = []   # [(second, bgr_array), ...]
-        second_buffer: list = []   # parallel second indices
+    frame_buffer:  list = []   # [(bgr_array), ...]
+    second_buffer: list = []   # parallel second indices
 
+    def _flush_buffer() -> None:
+        """Run batched inference on accumulated frames and populate second_buckets."""
+        if frame_buffer:
+            detections = run_inference(model, frame_buffer)
+            for sec, det in zip(second_buffer, detections):
+                second_buckets.setdefault(sec, []).append(det)
+            frame_buffer.clear()
+            second_buffer.clear()
+
+    try:
+        # Stream frames from decoder
         for second, frame in decode_frames(video_bytes):
             frame_buffer.append(frame)
             second_buffer.append(second)
             last_second = max(last_second, second)
 
-            # Run inference when buffer is full
+            # Run inference when buffer reaches batch_size
             if len(frame_buffer) >= batch_size:
-                detections = run_inference(model, frame_buffer)
-                for sec, det in zip(second_buffer, detections):
-                    second_buckets.setdefault(sec, []).append(det)
-                frame_buffer.clear()
-                second_buffer.clear()
+                _flush_buffer()
 
-        # Flush remaining frames
-        if frame_buffer:
-            detections = run_inference(model, frame_buffer)
-            for sec, det in zip(second_buffer, detections):
-                second_buckets.setdefault(sec, []).append(det)
+        # Flush any remaining frames
+        _flush_buffer()
 
-        # Write all complete seconds in order
-        if second_buckets:
-            # Fill any gaps between 0 and last_second (seconds with no frames
-            # still need a line: {"objects": [], "people": 0})
+        # Write all complete seconds in order (0 up to last_second)
+        if last_second >= 0:
             for sec in range(last_second + 1):
                 if sec not in second_buckets:
                     second_buckets[sec] = []
             for sec in sorted(second_buckets.keys()):
                 _write_second(sec)
-
-        elif last_second == -1:
-            # Video had no decodeable frames at all
+        else:
             raise ValueError("no frames decoded")
 
         out_file.flush()
 
     except Exception as exc:
-        # Keep lines already written; add one error line for this video
+        # Keep lines already written; flush buffer and write what we have, then add error line
+        try:
+            _flush_buffer()
+        except Exception:
+            pass
+
+        if last_second >= 0:
+            for sec in sorted(list(second_buckets.keys())):
+                try:
+                    _write_second(sec)
+                except Exception:
+                    pass
+
         error_msg = str(exc).replace("\n", " ")[:200]
         out_file.write(json.dumps({"video": video_id, "error": error_msg}) + "\n")
         out_file.flush()

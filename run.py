@@ -20,7 +20,9 @@ import io
 import json
 import math
 import pathlib
+import queue
 import sys
+import threading
 
 import av
 import cv2
@@ -313,6 +315,51 @@ def run_inference(model: YOLO, frames: list) -> list:
 # ---------------------------------------------------------------------------
 # Single-video processing (streaming output, low memory footprint)
 # ---------------------------------------------------------------------------
+#
+# Decode runs in a background thread that pushes subsampled frames onto a
+# bounded queue; the main thread pulls batches off that queue and runs GPU
+# inference. This overlaps CPU decode of the *next* batch with GPU inference
+# of the *current* one, instead of doing them strictly one after another.
+# Per-video batching and write semantics are unchanged from the synchronous
+# version — only *where* decode happens changed, not when results get
+# written or how a mid-video error is handled.
+# ---------------------------------------------------------------------------
+
+def _decode_worker(video_bytes: bytes, frame_q: "queue.Queue") -> None:
+    """
+    Runs in a background thread. Decodes + subsamples one video and pushes
+    results onto frame_q as ("frame", second, frame_bgr) items, followed by
+    exactly one ("done", last_seen_second, error_msg_or_None) sentinel.
+    Never raises — any decode exception is converted into the sentinel's
+    error_msg so the main thread doesn't need to catch across threads.
+    """
+    sample_second = -1
+    sample_slot   = -1
+    last_seen_second = -1
+    error_msg = None
+
+    try:
+        for second, frac, frame in decode_frames(video_bytes):
+            last_seen_second = max(last_seen_second, second)
+
+            # Subsample: keep at most SAMPLE_FPS frames per second.
+            if second != sample_second:
+                sample_second = second
+                sample_slot = -1
+            slot = int(frac * SAMPLE_FPS)
+            if slot == sample_slot:
+                continue  # already kept a sample for this time-slot
+            sample_slot = slot
+
+            frame_q.put(("frame", second, frame))
+
+        if last_seen_second < 0:
+            error_msg = "no frames decoded"
+    except Exception as exc:
+        error_msg = str(exc).replace("\n", " ")[:200]
+
+    frame_q.put(("done", last_seen_second, error_msg))
+
 
 def process_video(
     model:       YOLO,
@@ -335,7 +382,6 @@ def process_video(
 
     second_buckets: dict = {}
     next_second_to_write = 0
-    last_seen_second     = -1
 
     def _write_second(sec: int) -> None:
         frame_dets = second_buckets.pop(sec, [])
@@ -350,15 +396,6 @@ def process_video(
 
     frame_buffer:  list = []   # [(bgr_array), ...]
     second_buffer: list = []   # parallel second indices
-
-    # --- Frame subsampling state (SAMPLE_FPS is the only knob to tune) -------
-    # Each second is divided into SAMPLE_FPS equal time-slots; we keep only
-    # the first frame seen in each slot, so at most SAMPLE_FPS frames per
-    # second reach the model. last_seen_second above still tracks every
-    # decoded frame, so output coverage (which seconds get written) is
-    # unaffected by subsampling.
-    sample_second = -1
-    sample_slot   = -1
 
     def _flush_buffer() -> None:
         if frame_buffer:
@@ -375,62 +412,63 @@ def process_video(
             _write_second(next_second_to_write)
             next_second_to_write += 1
 
-    try:
-        for second, frac, frame in decode_frames(video_bytes):
-            last_seen_second = max(last_seen_second, second)
+    # Bounded so the decoder thread can run a few batches ahead of inference
+    # (giving the overlap room to work) without buffering an entire video's
+    # frames in memory if inference ever falls behind decode.
+    frame_q: "queue.Queue" = queue.Queue(maxsize=batch_size * 4)
+    decoder_thread = threading.Thread(
+        target=_decode_worker, args=(video_bytes, frame_q), daemon=True
+    )
+    decoder_thread.start()
 
-            # Subsample: keep at most SAMPLE_FPS frames per second.
-            if second != sample_second:
-                sample_second = second
-                sample_slot = -1
-            slot = int(frac * SAMPLE_FPS)
-            if slot == sample_slot:
-                continue  # already kept a sample for this time-slot
-            sample_slot = slot
+    last_seen_second = -1
+    error_msg = None
 
+    while True:
+        kind, a, b = frame_q.get()
+        if kind == "frame":
+            second, frame = a, b
             frame_buffer.append(frame)
             second_buffer.append(second)
-
-            # Flush inference batch when full
             if len(frame_buffer) >= batch_size:
                 _flush_buffer()
                 _emit_ready_seconds(second)
+        else:  # "done"
+            last_seen_second, error_msg = a, b
+            break
 
-        # Flush remaining frames at end of video
+    decoder_thread.join()
+
+    # Flush whatever's left in the buffer. If this itself raises (e.g. the
+    # GPU call on the tail batch fails), treat it the same as a decode-time
+    # error: everything already written stands, and we drop only the
+    # unresolved tail rather than the whole video.
+    try:
         _flush_buffer()
+    except Exception as exc:
+        if error_msg is None:
+            error_msg = str(exc).replace("\n", " ")[:200]
 
-        # Emit all remaining seconds up to and including last_seen_second
+    if error_msg is None:
+        # Success: emit every second from 0 through last_seen_second inclusive.
         if last_seen_second >= 0:
             while next_second_to_write <= last_seen_second:
                 _write_second(next_second_to_write)
                 next_second_to_write += 1
         else:
-            raise ValueError("no frames decoded")
+            error_msg = "no frames decoded"  # safety net; _decode_worker already sets this
 
-        out_file.flush()
-
-    except Exception as exc:
-        # If video fails partway through:
-        # 1. Flush any remaining decoded frames
-        try:
-            _flush_buffer()
-        except Exception:
-            pass
-
-        # 2. Emit all completed seconds strictly before last_seen_second
-        # (Preserves completed seconds, fills gaps with empty seconds, and avoids partial crash second)
-        try:
-            if last_seen_second > 0:
-                while next_second_to_write < last_seen_second:
-                    _write_second(next_second_to_write)
-                    next_second_to_write += 1
-        except Exception:
-            pass
-
-        # 3. Append exactly one error line (section 4 requirement)
-        error_msg = str(exc).replace("\n", " ")[:200]
+    if error_msg is not None:
+        # Error: emit only seconds strictly before last_seen_second (the
+        # second in progress when the error occurred may be incomplete),
+        # then exactly one error line (section 4 requirement).
+        if last_seen_second > 0:
+            while next_second_to_write < last_seen_second:
+                _write_second(next_second_to_write)
+                next_second_to_write += 1
         out_file.write(json.dumps({"video": video_id, "error": error_msg}) + "\n")
-        out_file.flush()
+
+    out_file.flush()
 
 
 # ---------------------------------------------------------------------------

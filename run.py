@@ -118,15 +118,20 @@ def _get_rotation_code(stream, frame) -> int | None:
     return None
 
 
-def decode_frames(video_bytes: bytes):
+def decode_frames(video_bytes: bytes, sample_fps: int):
     """
-    Decode all frames from a video stored as raw bytes in a single pass.
+    Decode frames from a video stored as raw bytes in a single pass, keeping
+    only the subsampled subset the caller actually needs.
 
-    Yields (second_index: int, frac_within_second: float, frame_bgr: np.ndarray)
-    for every frame. frac_within_second is only used for subsampling and never
-    affects which second a frame is assigned to.
+    Yields (second_index: int, frame_bgr: np.ndarray) for each KEPT frame —
+    at most sample_fps per second, picked by dividing each second into
+    sample_fps equal time-slots and keeping the first frame in each slot.
+    The subsampling decision happens BEFORE the expensive BGR conversion /
+    rotation, so a dropped frame costs only cheap PTS arithmetic, not a
+    swscale color-convert + cv2.rotate on data that's about to be discarded.
+
     - Uses exact Fraction arithmetic on integer PTS differences to prevent float drift.
-    - Clamps non-monotonic PTS jumps.
+    - Clamps non-monotonic PTS jumps (and the resulting frac, see below).
     - Demuxes with per-packet AVError recovery so single corrupt packets don't abort playable video.
     - Flushes remaining frames from the decoder at EOF.
     - Rotation is determined on the first decoded frame and applied to all frames.
@@ -151,6 +156,11 @@ def decode_frames(video_bytes: bytes):
         last_second = 0
         frame_count = 0
 
+        # Subsampling state: each second is divided into sample_fps equal
+        # time-slots; we keep only the first frame seen in each slot.
+        sample_second = -1
+        sample_slot   = -1
+
         # Precompute stream duration in seconds if available
         stream_duration_sec = None
         if stream.duration is not None and stream.time_base is not None:
@@ -161,6 +171,7 @@ def decode_frames(video_bytes: bytes):
 
         def _process_frame(frame):
             nonlocal rotate_code, rotation_determined, first_pts, first_time, last_second, frame_count
+            nonlocal sample_second, sample_slot
 
             if not rotation_determined:
                 rotate_code = _get_rotation_code(stream, frame)
@@ -199,13 +210,31 @@ def decode_frames(video_bytes: bytes):
 
             # Fractional position within the second (0.0-1.0), used only to
             # pick evenly-spaced samples — does not affect second boundaries.
+            # Clamped because the backward-jump guard above can force `second`
+            # upward without changing `rel`, which would otherwise make this
+            # negative (and silently corrupt the slot bookkeeping below).
             frac = float(rel) - second
+            frac = max(0.0, min(0.999999, frac))
+
+            if second != sample_second:
+                sample_second = second
+                sample_slot = -1
+            slot = int(frac * sample_fps)
+            # <= rather than == : after the backward-jump clamp above, a
+            # frame's "true" position can still map to a slot at or below one
+            # we've already kept for this second, even post-clamp. == would
+            # let such a frame through and reset sample_slot backward,
+            # causing every later frame in the second to be over-sampled;
+            # <= rejects it like any other already-covered slot.
+            if slot <= sample_slot:
+                return None  # subsampled out — never pay for ndarray/rotate
+            sample_slot = slot
 
             img = frame.to_ndarray(format="bgr24")
             if rotate_code is not None:
                 img = cv2.rotate(img, rotate_code)
 
-            return second, frac, img
+            return second, img
 
         # Demux packets with per-packet AVError recovery.
         # Note: Do not skip packet.size == 0; PyAV's empty EOF packet triggers internal B-frame flushing.
@@ -325,40 +354,53 @@ def run_inference(model: YOLO, frames: list) -> list:
 # written or how a mid-video error is handled.
 # ---------------------------------------------------------------------------
 
-def _decode_worker(video_bytes: bytes, frame_q: "queue.Queue") -> None:
+def _decode_worker(
+    video_bytes: bytes,
+    frame_q:     "queue.Queue",
+    stop_event:  "threading.Event",
+) -> None:
     """
-    Runs in a background thread. Decodes + subsamples one video and pushes
-    results onto frame_q as ("frame", second, frame_bgr) items, followed by
-    exactly one ("done", last_seen_second, error_msg_or_None) sentinel.
+    Runs in a background thread. Decodes one video (decode_frames already
+    applies subsampling before handing frames back, so no filtering happens
+    here) and pushes results onto frame_q as ("frame", second, frame_bgr)
+    items, followed by exactly one ("done", last_seen_second,
+    error_msg_or_None) sentinel.
+
     Never raises — any decode exception is converted into the sentinel's
     error_msg so the main thread doesn't need to catch across threads.
+
+    stop_event: set by the consumer if it gives up early (e.g. an inference
+    failure mid-video). Checked before every enqueue attempt, and enqueues
+    use a bounded timeout rather than a plain blocking put, so this thread
+    can never be left permanently blocked pushing into a queue nobody is
+    draining anymore.
     """
-    sample_second = -1
-    sample_slot   = -1
+    def _try_put(item) -> bool:
+        while not stop_event.is_set():
+            try:
+                frame_q.put(item, timeout=0.5)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     last_seen_second = -1
     error_msg = None
 
     try:
-        for second, frac, frame in decode_frames(video_bytes):
+        for second, frame in decode_frames(video_bytes, SAMPLE_FPS):
+            if stop_event.is_set():
+                return  # consumer already gave up; stop decoding early
             last_seen_second = max(last_seen_second, second)
-
-            # Subsample: keep at most SAMPLE_FPS frames per second.
-            if second != sample_second:
-                sample_second = second
-                sample_slot = -1
-            slot = int(frac * SAMPLE_FPS)
-            if slot == sample_slot:
-                continue  # already kept a sample for this time-slot
-            sample_slot = slot
-
-            frame_q.put(("frame", second, frame))
+            if not _try_put(("frame", second, frame)):
+                return  # stop_event was set while we were waiting to enqueue
 
         if last_seen_second < 0:
             error_msg = "no frames decoded"
     except Exception as exc:
         error_msg = str(exc).replace("\n", " ")[:200]
 
-    frame_q.put(("done", last_seen_second, error_msg))
+    _try_put(("done", last_seen_second, error_msg))
 
 
 def process_video(
@@ -366,7 +408,7 @@ def process_video(
     video_bytes: bytes,
     video_id:    str,
     out_file,
-    batch_size:  int = 32,
+    batch_size:  int,  # always supplied by main() from _pick_batch_size(), no fallback here
 ) -> None:
     """
     Process one video end-to-end with progressive line-by-line streaming.
@@ -416,38 +458,65 @@ def process_video(
     # (giving the overlap room to work) without buffering an entire video's
     # frames in memory if inference ever falls behind decode.
     frame_q: "queue.Queue" = queue.Queue(maxsize=batch_size * 4)
+    stop_event = threading.Event()
     decoder_thread = threading.Thread(
-        target=_decode_worker, args=(video_bytes, frame_q), daemon=True
+        target=_decode_worker, args=(video_bytes, frame_q, stop_event), daemon=True
     )
     decoder_thread.start()
 
     last_seen_second = -1
     error_msg = None
+    exited_via_done = False
 
-    while True:
-        kind, a, b = frame_q.get()
-        if kind == "frame":
-            second, frame = a, b
-            frame_buffer.append(frame)
-            second_buffer.append(second)
-            if len(frame_buffer) >= batch_size:
-                _flush_buffer()
-                _emit_ready_seconds(second)
-        else:  # "done"
-            last_seen_second, error_msg = a, b
-            break
-
-    decoder_thread.join()
-
-    # Flush whatever's left in the buffer. If this itself raises (e.g. the
-    # GPU call on the tail batch fails), treat it the same as a decode-time
-    # error: everything already written stands, and we drop only the
-    # unresolved tail rather than the whole video.
     try:
-        _flush_buffer()
+        while True:
+            kind, a, b = frame_q.get()
+            if kind == "frame":
+                second, frame = a, b
+                frame_buffer.append(frame)
+                second_buffer.append(second)
+                if len(frame_buffer) >= batch_size:
+                    _flush_buffer()
+                    _emit_ready_seconds(second)
+            else:  # "done"
+                last_seen_second, error_msg = a, b
+                exited_via_done = True
+                break
     except Exception as exc:
-        if error_msg is None:
-            error_msg = str(exc).replace("\n", " ")[:200]
+        # e.g. CUDA OOM or a malformed frame batch inside _flush_buffer().
+        # Previously this propagated out of process_video uncaught, which
+        # (a) skipped writing anything at all for this video, (b) aborted
+        # the rest of the current parquet file's videos too, since the only
+        # try/except around this call is at the parquet-file level in
+        # main(), and (c) could leave the decoder thread permanently
+        # blocked trying to enqueue into a queue nobody drains anymore.
+        # Caught here instead: drop the in-flight batch (don't retry it),
+        # record the error, and let the normal error-handling path below
+        # write everything that completed before it.
+        error_msg = str(exc).replace("\n", " ")[:200]
+        if second_buckets:
+            last_seen_second = max(last_seen_second, max(second_buckets.keys()))
+        if second_buffer:
+            last_seen_second = max(last_seen_second, max(second_buffer))
+        frame_buffer.clear()
+        second_buffer.clear()
+    finally:
+        # Tell the decoder thread to stop (harmless/no-op if it already
+        # finished) and bound the wait — _try_put() in _decode_worker checks
+        # this every ≤0.5s even mid-enqueue, so this should return promptly.
+        stop_event.set()
+        decoder_thread.join(timeout=5.0)
+
+    if exited_via_done:
+        # Flush whatever's left in the buffer. If this itself raises (e.g.
+        # the GPU call on the tail batch fails), treat it the same as a
+        # decode-time error: everything already written stands, and we drop
+        # only the unresolved tail rather than the whole video.
+        try:
+            _flush_buffer()
+        except Exception as exc:
+            if error_msg is None:
+                error_msg = str(exc).replace("\n", " ")[:200]
 
     if error_msg is None:
         # Success: emit every second from 0 through last_seen_second inclusive.
@@ -472,6 +541,64 @@ def process_video(
 
 
 # ---------------------------------------------------------------------------
+# Resume support (opt-in via --resume; irrelevant to the grader's fresh VM)
+# ---------------------------------------------------------------------------
+
+def _scan_resume_state(output_path: "pathlib.Path", parquet_files: list) -> tuple:
+    """
+    Reads an existing --output file from a previous, interrupted run and
+    decides which .parquet files were fully completed.
+
+    A file only counts as fully completed if the highest row index seen for
+    it in the existing output equals (num_rows_in_that_file - 1) — every row
+    has at least one line (result or error) written. Any file that is only
+    partially present has ALL of its lines discarded here and is fully
+    reprocessed from scratch on this run, so no video can ever end up with
+    duplicate or half-written-then-complete entries in the final file.
+
+    Returns (kept_lines, done_file_names).
+    """
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        return [], set()
+
+    num_rows_by_file = {}
+    for p in parquet_files:
+        try:
+            num_rows_by_file[p.name] = pq.ParquetFile(p).metadata.num_rows
+        except Exception:
+            num_rows_by_file[p.name] = None  # unreadable right now -> never counts as "done"
+
+    max_row_seen:  dict = {}
+    lines_by_file: dict = {}
+
+    with open(output_path, "r") as f:
+        for raw_line in f:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                video_field = json.loads(line)["video"]
+                file_name, row_str = video_field.rsplit(":", 1)
+                row_idx = int(row_str)
+            except Exception:
+                continue  # malformed line (e.g. truncated mid-write by a kill) -> drop it
+            lines_by_file.setdefault(file_name, []).append(line)
+            if row_idx > max_row_seen.get(file_name, -1):
+                max_row_seen[file_name] = row_idx
+
+    kept_lines: list = []
+    done_files: set = set()
+    for file_name, lines in lines_by_file.items():
+        total = num_rows_by_file.get(file_name)
+        if total is not None and max_row_seen.get(file_name, -1) == total - 1:
+            kept_lines.extend(lines)
+            done_files.add(file_name)
+        # else: incomplete, or file no longer present -> discard, reprocess fully below
+
+    return kept_lines, done_files
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -488,6 +615,18 @@ def main() -> None:
         "--output",
         required=True,
         help="Output path for the JSONL results file (e.g. results.jsonl)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume a previous run: skip .parquet files that are already fully "
+            "written to --output, and cleanly redo (from scratch) any file that "
+            "was only partially done when the previous run stopped. Off by "
+            "default, so the brief's required invocation is unaffected — this "
+            "is only for your own multi-session runs (e.g. Kaggle/Colab "
+            "free-tier time limits), not for grading."
+        ),
     )
     args = parser.parse_args()
 

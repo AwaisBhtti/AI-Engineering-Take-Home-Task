@@ -1,0 +1,1 @@
+subsampling at 15 instead of 3,5. row by row batching parquet file.

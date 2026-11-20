@@ -74,6 +74,7 @@ def get_rotation_code(stream, frame):
 
     return None
 
+
 def decode_frames(video_bytes, sample_fps):
     container = av.open(io.BytesIO(video_bytes))
     try:
@@ -94,11 +95,16 @@ def decode_frames(video_bytes, sample_fps):
         sample_second = -1
         sample_slot = -1
 
+        pending_decode_error = None
         for packet in container.demux(stream):
             try:
                 frames = packet.decode()
-            except av.error.FFmpegError:
+            except av.error.FFmpegError as exc:
+                pending_decode_error = error_text(exc)
                 continue
+
+            if frames:
+                pending_decode_error = None
 
             for frame in frames:
                 if not rotation_checked:
@@ -134,8 +140,14 @@ def decode_frames(video_bytes, sample_fps):
                 if rotation_code is not None:
                     image = cv2.rotate(image, rotation_code)
                 yield second, image
+
+        if pending_decode_error is not None:
+            raise ValueError(
+                f"Decoder failed before end of video: {pending_decode_error}"
+            )
     finally:
         container.close()
+
 
 def aggregate_second(frame_detections):
     if not frame_detections:
@@ -370,18 +382,22 @@ def main():
 
                 for batch in parquet.iter_batches(batch_size=10, columns=["mp4"]):
                     column = batch.column(0)
-                    for item in column:
+                    for i in range(batch.num_rows):
                         video_id = f"{path.name}:{row_index}"
-                        process_video(
-                            model,
-                            item.as_py(),
-                            video_id,
-                            output,
-                            batch_size,
-                            quantize,
-                        )
                         row_index += 1
                         total_videos += 1
+
+                        try:
+                            video_bytes = column[i].as_py()
+                        except Exception as exc:
+                            row = {"video": video_id, "error": error_text(exc)}
+                            output.write(json.dumps(row) + "\n")
+                            continue
+
+                        process_video(
+                            model, video_bytes, video_id, output, batch_size, quantize
+                        )
+                        del video_bytes
             except Exception as exc:
                 print(f"Error processing {path.name}: {exc}", file=sys.stderr)
                 file_errors += 1

@@ -15,7 +15,7 @@
 # Core inference
 torch==2.6.0
 torchvision==0.21.0
-ultralytics==8.3.145
+ultralytics==8.4.216
 numpy==1.26.4
 
 # Data & video decoding

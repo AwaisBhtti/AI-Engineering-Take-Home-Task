@@ -74,7 +74,6 @@ def get_rotation_code(stream, frame):
 
     return None
 
-
 def decode_frames(video_bytes, sample_fps):
     container = av.open(io.BytesIO(video_bytes))
     try:
@@ -86,10 +85,6 @@ def decode_frames(video_bytes, sample_fps):
             stream.thread_type = "AUTO"
         except Exception:
             pass
-
-        duration = None
-        if stream.duration is not None and stream.time_base is not None:
-            duration = float(stream.duration * stream.time_base)
 
         rotation_checked = False
         rotation_code = None
@@ -103,7 +98,6 @@ def decode_frames(video_bytes, sample_fps):
             try:
                 frames = packet.decode()
             except av.error.FFmpegError:
-                # A damaged packet can be followed by playable packets.
                 continue
 
             for frame in frames:
@@ -123,19 +117,9 @@ def decode_frames(video_bytes, sample_fps):
                     continue
 
                 second = max(0, math.floor(rel))
-
-                # Forward gaps are allowed. A timestamp far beyond the
-                # declared duration is reported as a video error.
-                if duration is not None and second > duration + 30:
-                    raise ValueError(
-                        f"Frame at {second}s exceeds declared video "
-                        f"duration {duration:.1f}s"
-                    )
-
                 second = max(second, last_second)
                 last_second = second
 
-                # Keep the same first-frame-per-time-slot sampling rule.
                 fraction = max(0.0, min(0.999999, float(rel) - second))
                 if second != sample_second:
                     sample_second = second
@@ -152,7 +136,6 @@ def decode_frames(video_bytes, sample_fps):
                 yield second, image
     finally:
         container.close()
-
 
 def aggregate_second(frame_detections):
     if not frame_detections:
